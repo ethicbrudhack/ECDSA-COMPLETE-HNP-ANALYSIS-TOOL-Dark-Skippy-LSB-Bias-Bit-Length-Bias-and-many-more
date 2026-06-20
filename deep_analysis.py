@@ -23,6 +23,68 @@ Gy = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
 P = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
 
 # ============================================================
+# BECH32 - DLA ADRESÓW SEGWIT (bc1)
+# ============================================================
+BECH32_ALPHABET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+def bech32_polymod(values):
+    GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+    chk = 1
+    for v in values:
+        b = (chk >> 25)
+        chk = (chk & 0x1ffffff) << 5 ^ v
+        for i in range(5):
+            chk ^= GEN[i] if ((b >> i) & 1) else 0
+    return chk
+
+def bech32_hrp_expand(hrp):
+    return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
+
+def bech32_create_checksum(hrp, data):
+    values = bech32_hrp_expand(hrp) + data
+    polymod = bech32_polymod(values + [0, 0, 0, 0, 0, 0]) ^ 1
+    return [(polymod >> 5 * (5 - i)) & 31 for i in range(6)]
+
+def convertbits(data, frombits, tobits, pad=True):
+    acc = 0
+    bits = 0
+    ret = []
+    maxv = (1 << tobits) - 1
+    max_acc = (1 << (frombits + tobits - 1)) - 1
+    for value in data:
+        if value < 0 or (value >> frombits):
+            return None
+        acc = ((acc << frombits) | value) & max_acc
+        bits += frombits
+        while bits >= tobits:
+            bits -= tobits
+            ret.append((acc >> bits) & maxv)
+    if pad:
+        if bits:
+            ret.append((acc << (tobits - bits)) & maxv)
+    elif bits >= frombits or ((acc << (tobits - bits)) & maxv):
+        return None
+    return ret
+
+def bech32_encode(hrp, version, program):
+    if version < 0 or version > 16:
+        return None
+    if len(program) < 2 or len(program) > 40:
+        return None
+    if version == 0 and len(program) not in [20, 32]:
+        return None
+    
+    five_bit_data = convertbits(program, 8, 5, True)
+    if five_bit_data is None:
+        return None
+    
+    data = [version] + five_bit_data
+    checksum = bech32_create_checksum(hrp, data)
+    combined = data + checksum
+    address = hrp + "1" + "".join(BECH32_ALPHABET[x] for x in combined)
+    return address
+
+# ============================================================
 # STRUKTURA PODPISU
 # ============================================================
 @dataclass
@@ -113,23 +175,59 @@ def parse_tx_file(filename: str) -> List[Signature]:
     
     return signatures
 
-def pubkey_to_address(pubkey_hex: str) -> str:
-    """Konwertuje pubkey na adres Bitcoin"""
+def pubkey_to_all_addresses(pubkey_hex: str) -> Dict:
+    """
+    Konwertuje pubkey na WSZYSTKIE możliwe typy adresów Bitcoin
+    
+    Returns:
+        Dict z adresami: {'P2PKH': '1...', 'P2WPKH': 'bc1q...', 'P2SH-P2WPKH': '3...'}
+    """
     try:
-        # SHA-256
-        sha = hashlib.sha256(bytes.fromhex(pubkey_hex)).digest()
-        # RIPEMD-160
+        pubkey_bytes = bytes.fromhex(pubkey_hex)
+        
+        # SHA-256 + RIPEMD-160
+        sha = hashlib.sha256(pubkey_bytes).digest()
         ripemd = hashlib.new('ripemd160')
         ripemd.update(sha)
-        # Version byte (0x00 for mainnet)
-        network = b'\x00' + ripemd.digest()
-        # Checksum
+        pubkey_hash = ripemd.digest()
+        
+        addresses = {}
+        
+        # 1. P2PKH (adresy 1...)
+        network = b'\x00' + pubkey_hash
         checksum = hashlib.sha256(hashlib.sha256(network).digest()).digest()[:4]
-        # Base58 encode
-        address = base58.b58encode(network + checksum).decode()
-        return address
-    except:
-        return "ERROR"
+        addresses['P2PKH'] = base58.b58encode(network + checksum).decode()
+        
+        # 2. P2WPKH (adresy bc1q...)
+        p2wpkh = bech32_encode('bc', 0, pubkey_hash)
+        if p2wpkh:
+            addresses['P2WPKH'] = p2wpkh
+        
+        # 3. P2SH-P2WPKH (adresy 3...)
+        redeem_script = b'\x00\x14' + pubkey_hash
+        script_hash = hashlib.new('ripemd160')
+        script_hash.update(hashlib.sha256(redeem_script).digest())
+        network = b'\x05' + script_hash.digest()
+        checksum = hashlib.sha256(hashlib.sha256(network).digest()).digest()[:4]
+        addresses['P2SH-P2WPKH'] = base58.b58encode(network + checksum).decode()
+        
+        return addresses
+        
+    except Exception as e:
+        return {'ERROR': str(e)}
+
+def detect_address_type(address: str) -> str:
+    """Określa typ adresu Bitcoin"""
+    if address.startswith('1'):
+        return 'P2PKH'
+    elif address.startswith('3'):
+        return 'P2SH'
+    elif address.startswith('bc1q'):
+        return 'P2WPKH'
+    elif address.startswith('bc1p'):
+        return 'P2TR'
+    else:
+        return 'UNKNOWN'
 
 def shannon_entropy(counter: Counter, total: int) -> float:
     entropy = 0.0
@@ -380,6 +478,7 @@ def calculate_risk_score(signatures: List[Signature]) -> Dict:
             'risk_score': 0,
             'confidence': 0.0,
             'level': 'INSUFFICIENT_DATA',
+            'reasons': [],
             'note': f'Za mało podpisów ({sample_size}) - potrzeba >=50'
         }
     
@@ -526,7 +625,7 @@ def analyze_address_deep(address: str, pubkey: str, signatures: List[Signature])
     small_r = [s for s in sigs if s.r < 2**80]
     if small_r:
         print(f"    ⚠️ Małe r (<2^80): {len(small_r)} podpisów")
-        for sig in small_r:
+        for sig in small_r[:5]:
             print(f"       - {sig.txid[:20]}... r={hex(sig.r)[:20]}...")
     
     # z values
@@ -575,6 +674,8 @@ def analyze_address_deep(address: str, pubkey: str, signatures: List[Signature])
                 print(f"    Odchylenie: {runs['deviation_sigma']:.2f}σ")
                 if runs.get('is_suspicious'):
                     print("    ⚠️ PODEJRZANY!")
+        else:
+            print("\n  🎲 Runs test: (pominięty - potrzeba >=50 podpisów)")
         
         # Mutual Information (jeśli >=50)
         if len(sigs) >= 50:
@@ -584,6 +685,8 @@ def analyze_address_deep(address: str, pubkey: str, signatures: List[Signature])
                 print(f"    MI: {mi['mutual_information']:.4f}")
                 if mi.get('is_suspicious'):
                     print("    ⚠️ PODEJRZANY!")
+        else:
+            print("\n  🔄 Mutual Information: (pominięty - potrzeba >=50 podpisów)")
         
         # HNP Structure
         print("\n  🧩 Struktura HNP:")
@@ -611,7 +714,7 @@ def analyze_address_deep(address: str, pubkey: str, signatures: List[Signature])
         print(f"  Level: {risk['level']}")
         print(f"  {risk['note']}")
         
-        if risk['reasons']:
+        if risk.get('reasons'):
             print(f"\n  Czynniki ryzyka:")
             for reason in risk['reasons']:
                 print(f"    - {reason}")
@@ -620,19 +723,44 @@ def analyze_address_deep(address: str, pubkey: str, signatures: List[Signature])
             print(f"\n  ⚠️ {risk['limitation']}")
     
     # ============================================================
-    # 6. ADRES Z PUBKEY
+    # 6. WERYFIKACJA ADRESU - POPRAWIONA!
     # ============================================================
     print("\n" + "─"*100)
     print("🔑 WERYFIKACJA ADRESU")
     print("─"*100)
     
-    calculated_address = pubkey_to_address(pubkey)
-    print(f"  Adres z pubkey: {calculated_address}")
-    print(f"  Podany adres:   {address}")
-    if calculated_address == address:
-        print("  ✅ Adresy się zgadzają")
+    # Sprawdź typ adresu
+    addr_type = detect_address_type(address)
+    print(f"  Typ adresu: {addr_type}")
+    
+    # Generuj wszystkie możliwe adresy
+    all_addresses = pubkey_to_all_addresses(pubkey)
+    
+    if 'ERROR' in all_addresses:
+        print(f"  ❌ Błąd konwersji: {all_addresses['ERROR']}")
     else:
-        print("  ⚠️ Adresy NIE zgadzają się - sprawdź pubkey")
+        print(f"\n  Wszystkie adresy dla tego pubkey:")
+        for atype, addr in all_addresses.items():
+            match = "✅" if addr == address else "  "
+            print(f"    {match} {atype}: {addr}")
+        
+        # Sprawdź czy adres pasuje
+        if address in all_addresses.values():
+            print(f"\n  ✅ ADRESY SIĘ ZGADZAJĄ!")
+            # Znajdź typ
+            for atype, addr in all_addresses.items():
+                if addr == address:
+                    print(f"  Typ: {atype}")
+                    results['address_type'] = atype
+                    break
+        else:
+            print(f"\n  ⚠️ ADRESY NIE ZGADZAJĄ SIĘ!")
+            print(f"  Podany adres: {address}")
+            print(f"  To NIE jest adres dla tego pubkey!")
+            print(f"\n  💡 Możliwe przyczyny:")
+            print(f"     1. Pubkey jest niepoprawny")
+            print(f"     2. To adres z innego klucza")
+            print(f"     3. To adres multisig (P2WSH)")
     
     # ============================================================
     # 7. PODSUMOWANIE
@@ -642,11 +770,13 @@ def analyze_address_deep(address: str, pubkey: str, signatures: List[Signature])
     print("="*100)
     
     print(f"\n  Adres: {address}")
+    print(f"  Typ: {addr_type}")
     print(f"  Liczba transakcji: {len(sigs)}")
     
     if reused['found']:
         print("  ⚠️⚠️⚠️ CRITICAL: REUSED NONCE - MOŻNA ODZYSKAĆ KLUCZ!")
     elif len(sigs) >= 50:
+        risk = results.get('risk', {})
         level = risk.get('level', 'UNKNOWN')
         if level == 'HIGH':
             print("  ⚠️ HIGH RISK: Podejrzenie biasu w r")
@@ -677,6 +807,7 @@ def save_report(results: Dict, filename: str = None):
         f.write("="*100 + "\n\n")
         f.write(f"Data: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
         f.write(f"Adres: {results.get('address', 'N/A')}\n")
+        f.write(f"Typ adresu: {results.get('address_type', 'UNKNOWN')}\n")
         f.write(f"Pubkey: {results.get('pubkey', 'N/A')}\n")
         f.write(f"Liczba podpisów: {results.get('signature_count', 0)}\n\n")
         
@@ -723,8 +854,8 @@ def save_report(results: Dict, filename: str = None):
 
 def main():
     # Konkretny adres i pubkey do analizy
-    TARGET_ADDRESS = "19MeFRgE2CPYWaezV2XuXPcT8LBpxkj8JN"
-    TARGET_PUBKEY = "02135605874100d749f079aee060392605d6b4008ad95ea52907ccf57c3e056ed2"
+    TARGET_ADDRESS = "bc1qjl4x4cr4l0qv2635u8j30l7pvt2vvtl094a908"
+    TARGET_PUBKEY = "03a9c697172a904783083dfaf9708149c52aafca5f2aec2c1c3c3cc74c7fe50108"
     
     if len(sys.argv) < 2:
         print("Użycie: python deep_analysis.py <plik_z_transakcjami.txt>")
